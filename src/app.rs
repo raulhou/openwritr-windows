@@ -867,6 +867,7 @@ fn cleanup_notice_kind(reason: &FallbackReason) -> NoticeKind {
         | FallbackReason::InvalidEndpoint
         | FallbackReason::EmptyModelId
         | FallbackReason::RequestFailed
+        | FallbackReason::ProviderRejected(_)
         | FallbackReason::ResponseUnparseable => NoticeKind::ProviderWarning,
         FallbackReason::EmptyCandidate
         | FallbackReason::IntegrityRejected(_)
@@ -2880,6 +2881,9 @@ impl AppHandler {
             FallbackReason::RequestFailed => {
                 format!("Provider request failed; raw transcript was {action}")
             }
+            FallbackReason::ProviderRejected(status) => format!(
+                "Provider rejected the request (HTTP {status}, see the log); raw transcript was {action}"
+            ),
             FallbackReason::ResponseUnparseable => {
                 format!("Provider response was invalid; raw transcript was {action}")
             }
@@ -2983,6 +2987,9 @@ impl AppHandler {
         self.state.discarding_jobs = mode == ShutdownMode::Discard;
         if mode == ShutdownMode::Discard {
             paste::cancel_pending_restorations();
+            // A cleanup request can wait minutes on a slow connection; quitting
+            // must not wait for it.
+            crate::enhance::cancel_requests();
         }
         let status = match mode {
             ShutdownMode::Wait => format!(

@@ -8,6 +8,7 @@ mod asr;
 mod audio;
 mod autostart;
 mod cleanup;
+mod copilot_auth;
 mod credentials;
 mod diagnostics;
 mod enhance;

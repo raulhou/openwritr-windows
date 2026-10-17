@@ -29,7 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cleanup::EndpointScope;
 
@@ -51,7 +51,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 /// each waiting out [`START_TIMEOUT`].
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 /// The server (and with it the NPU) is released after this much idleness.
-const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
+/// GenieX drops an idle model after five minutes anyway, so keeping the
+/// process longer only holds memory for a server that must reload first.
+const IDLE_STOP: Duration = Duration::from_secs(5 * 60);
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -430,6 +432,10 @@ struct Server {
     reaper_running: bool,
     /// The model has answered at least once since the server started.
     model_loaded: bool,
+    /// The model has written at normal speed since the server started.
+    was_fast: bool,
+    /// Slow answers in a row from this server.
+    slow_answers: u32,
 }
 
 static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
@@ -439,6 +445,8 @@ static SERVER: Lazy<Mutex<Server>> = Lazy::new(|| {
         failed_at: None,
         reaper_running: false,
         model_loaded: false,
+        was_fast: false,
+        slow_answers: 0,
     })
 });
 
@@ -458,6 +466,8 @@ pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), Local
             warn!("local model server exited; restarting");
             server.child = None;
             server.model_loaded = false;
+            server.was_fast = false;
+            server.slow_answers = 0;
             false
         }
         None => false,
@@ -475,6 +485,8 @@ pub fn ensure_running(endpoint: &EndpointScope) -> std::result::Result<(), Local
                 Ok(child) => {
                     server.child = Some(child);
                     server.model_loaded = false;
+                    server.was_fast = false;
+                    server.slow_answers = 0;
                     if !server.reaper_running {
                         server.reaper_running = true;
                         std::thread::spawn(reap_when_idle);
@@ -585,6 +597,27 @@ fn start_server() -> std::result::Result<Child, LocalLlmError> {
     Err(LocalLlmError::StartFailed("timed out".into()))
 }
 
+/// How loud a line of the server's output is in OpenWritr's log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineLevel {
+    /// Two lines per model step (hundreds per reply): only with
+    /// `RUST_LOG=openwritr=debug`, where they time each part of the model.
+    Debug,
+    Info,
+    /// The server or the NPU runtime reported an error.
+    Warn,
+}
+
+fn server_line_level(text: &str) -> LineLevel {
+    if text.contains("QnnGraph_execute") || text.contains("execution finished with result 0") {
+        LineLevel::Debug
+    } else if text.contains(" ERR ") || text.contains("<E>") {
+        LineLevel::Warn
+    } else {
+        LineLevel::Info
+    }
+}
+
 /// Copy a child's output into the log, one line at a time. Also keeps the
 /// pipe drained so the server can never block on a full buffer.
 fn forward_output(stream: impl Read + Send + 'static, name: &'static str) {
@@ -602,7 +635,11 @@ fn forward_output(stream: impl Read + Send + 'static, name: &'static str) {
                         let text = text.trim();
                         if !text.is_empty() {
                             let text: String = text.chars().take(600).collect();
-                            info!(stream = name, "geniex: {text}");
+                            match server_line_level(&text) {
+                                LineLevel::Debug => debug!(stream = name, "geniex: {text}"),
+                                LineLevel::Info => info!(stream = name, "geniex: {text}"),
+                                LineLevel::Warn => warn!(stream = name, "geniex: {text}"),
+                            }
                         }
                     }
                 }
@@ -643,6 +680,86 @@ fn stop_locked(server: &mut Server) {
         let _ = child.kill();
         let _ = child.wait();
     }
+    server.model_loaded = false;
+    server.was_fast = false;
+    server.slow_answers = 0;
+}
+
+/// Stop the server OpenWritr started, now, so the NPU and its memory go back
+/// to the rest of the system. The next request starts it again (and reloads
+/// the model, about half a minute). Does nothing when OpenWritr did not start
+/// a server, so a server the user runs is never touched. Also cancels
+/// whatever the server is still generating, e.g. a reply nobody waits for
+/// any more after a timeout.
+///
+/// Gives up quietly when another thread holds the server for longer than a
+/// moment (it is loading the model for a new request); the idle stop then
+/// releases it later.
+pub fn release(reason: &str) {
+    let Some(mut server) = SERVER.try_lock_for(Duration::from_secs(2)) else {
+        info!(reason, "local model server is busy; leaving it running");
+        return;
+    };
+    if server.child.is_some() {
+        info!(reason, "stopping the local model server");
+        stop_locked(&mut server);
+    }
+}
+
+/// Writing speed (tokens per second) below which the built-in model counts as
+/// slow. It normally writes about 18; in the slow state it wrote under 1.
+pub(crate) const SLOW_WRITING_TOKENS_PER_SECOND: f64 = 4.0;
+
+/// Whether a reply written at `tokens_per_second` should restart the server:
+/// only when the same server wrote at normal speed before. That is the slow
+/// state seen in practice (fast, then about 20 times slower for every later
+/// request until restarted). A PC where the model is always slow gains
+/// nothing from a restart, and each one costs a model load.
+fn restart_for_speed(tokens_per_second: f64, was_fast: bool) -> bool {
+    tokens_per_second < SLOW_WRITING_TOKENS_PER_SECOND && was_fast
+}
+
+/// Report how fast the built-in model wrote its last reply. Restarts the
+/// server when it has fallen into the slow state, so the next request gets a
+/// fresh one.
+pub fn note_writing_speed(tokens_per_second: f64) {
+    let Some(mut server) = SERVER.try_lock_for(Duration::from_secs(2)) else {
+        return;
+    };
+    if server.child.is_none() {
+        return;
+    }
+    if tokens_per_second >= SLOW_WRITING_TOKENS_PER_SECOND {
+        server.was_fast = true;
+        server.slow_answers = 0;
+        return;
+    }
+    server.slow_answers += 1;
+    if restart_for_speed(tokens_per_second, server.was_fast) {
+        warn!(
+            tokens_per_second,
+            "the local model has become slow; restarting it"
+        );
+        stop_locked(&mut server);
+    } else {
+        info!(
+            tokens_per_second,
+            "the local model writes slowly on this PC"
+        );
+    }
+}
+
+/// Slow answers in a row after which a long cleanup stops: at under 1 token a
+/// second a 48 minute transcript would take hours, holding the NPU and
+/// memory all that time. What is left is retried later.
+const SLOW_ANSWERS_TO_GIVE_UP: u32 = 2;
+
+/// Whether the built-in model has kept writing slowly (a long cleanup then
+/// stops instead of grinding on).
+pub fn keeps_writing_slowly() -> bool {
+    SERVER
+        .try_lock_for(Duration::from_secs(2))
+        .is_some_and(|server| server.slow_answers >= SLOW_ANSWERS_TO_GIVE_UP)
 }
 
 /// Stop the server (called when OpenWritr exits or the model is removed).
@@ -959,6 +1076,37 @@ mod tests {
             ..TestResult::default()
         };
         assert_eq!(bare.summary(), "Works: answered in 1.0 s.");
+    }
+
+    #[test]
+    fn server_output_is_logged_at_a_level_that_matches_it() {
+        // Lines as GenieX printed them in a real run.
+        let step = r"Oct 17 19:26:02.120 INF go\ml.go:233 [ML] [QNN]  <I> QnnGraph_execute started. graph = 0x4";
+        let done = r"Oct 17 19:26:02.125 INF go\ml.go:233 [ML] [QNN]  <I> Graph token_ar1_cl512_1_of_4 execution finished with result 0";
+        let error = r"Oct 17 19:25:34.739 ERR go\ml.go:237 [ML] [QNN]  <E> Failed to map buffer of size 538968064";
+        let summary = r"Oct 17 19:26:02.625 INF handler\chat_response.go:185 Generation complete prompt_tokens=332 decode_tok_s=18.1";
+        assert_eq!(server_line_level(step), LineLevel::Debug);
+        assert_eq!(server_line_level(done), LineLevel::Debug);
+        assert_eq!(server_line_level(error), LineLevel::Warn);
+        assert_eq!(server_line_level(summary), LineLevel::Info);
+        assert_eq!(
+            server_line_level("Local hosting on http://127.0.0.1:18651/"),
+            LineLevel::Info
+        );
+    }
+
+    #[test]
+    fn only_a_server_that_slowed_down_is_restarted() {
+        assert!(restart_for_speed(0.9, true), "fast before, slow now");
+        assert!(!restart_for_speed(0.9, false), "always slow here");
+        assert!(!restart_for_speed(18.2, true));
+        assert!(!restart_for_speed(SLOW_WRITING_TOKENS_PER_SECOND, true));
+    }
+
+    #[test]
+    fn releasing_without_a_started_server_does_nothing() {
+        release("test");
+        assert!(SERVER.lock().child.is_none());
     }
 
     #[test]

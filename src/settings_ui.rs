@@ -430,7 +430,7 @@ impl SettingsApp {
             }
             Err(TryRecvError::Disconnected) => {
                 self.copilot_readiness = Some(CopilotReadiness::Failed(
-                    "GitHub CLI readiness check stopped unexpectedly".into(),
+                    "GitHub Copilot sign-in check stopped unexpectedly".into(),
                 ));
                 self.copilot_rx = None;
             }
@@ -580,17 +580,15 @@ impl SettingsApp {
         if self.settings.enhance.mode.is_enabled() {
             match self.settings.enhance.provider.as_str() {
                 "github_copilot" => match self.copilot_readiness.as_ref() {
-                    Some(CopilotReadiness::Ready) => {}
+                    Some(CopilotReadiness::Ready(_)) => {}
                     Some(CopilotReadiness::CliMissing) => {
-                        return Some("GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.".into())
+                        return Some(enhance::CopilotAuthError::CliMissing.to_string())
                     }
                     Some(CopilotReadiness::NotAuthenticated) => {
-                        return Some(
-                            "GitHub CLI is not authenticated. Run `gh auth login` first.".into(),
-                        )
+                        return Some(enhance::CopilotAuthError::NotAuthenticated.to_string())
                     }
                     Some(CopilotReadiness::Failed(error)) => return Some(error.clone()),
-                    None => return Some("Checking GitHub CLI authentication...".into()),
+                    None => return Some("Looking for your GitHub Copilot sign-in...".into()),
                 },
                 "openai_compatible" => {
                     if let CredentialStatus::Error(error) = &self.credential_status {
@@ -1358,25 +1356,27 @@ impl SettingsApp {
             match self.copilot_readiness.as_ref() {
                 None => status_label(
                     ui,
-                    "Checking GitHub CLI authentication...",
+                    "Looking for your GitHub Copilot sign-in...",
                     secondary_text(),
                 ),
-                Some(CopilotReadiness::Ready) => {
-                    status_label(ui, "GitHub CLI authentication is ready.", status_green())
-                }
+                Some(CopilotReadiness::Ready(source)) => status_label(
+                    ui,
+                    &format!("Signed in through {}.", source.describe()),
+                    status_green(),
+                ),
                 Some(CopilotReadiness::CliMissing) => status_label(
                     ui,
-                    "GitHub CLI (gh) was not found. Install it (winget install GitHub.cli), then run gh auth login. The separate \"copilot\" command is not used.",
+                    &enhance::CopilotAuthError::CliMissing.to_string(),
                     error_color(),
                 ),
                 Some(CopilotReadiness::NotAuthenticated) => status_label(
                     ui,
-                    "GitHub CLI is not authenticated. Run `gh auth login`.",
+                    &enhance::CopilotAuthError::NotAuthenticated.to_string(),
                     error_color(),
                 ),
                 Some(CopilotReadiness::Failed(error)) => status_label(ui, error, error_color()),
             }
-            if !matches!(self.copilot_readiness, Some(CopilotReadiness::Ready))
+            if !matches!(self.copilot_readiness, Some(CopilotReadiness::Ready(_)))
                 && ui.small_button("Retry").clicked()
             {
                 self.restart_copilot_probe();

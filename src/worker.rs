@@ -759,6 +759,9 @@ fn worker_main(
             Command::Transcribe(job) => {
                 let _pending_job =
                     PendingJobGuard::new(&pending_jobs_by_generation, job.generation);
+                // However the job ends, a finished file or meeting transcript
+                // gives the NPU back instead of keeping the text model loaded.
+                let _release_local_model = ReleaseLocalModel::after(&job.config);
                 {
                     let _transition = transition_gate.lock();
                     if discard_requested.load(Ordering::Acquire) {
@@ -1168,6 +1171,34 @@ fn worker_main(
             }
         }
     }
+}
+
+/// Stops OpenWritr's own local text model when dropped, if the job it was made
+/// for asks for that (see [`releases_local_model`]).
+struct ReleaseLocalModel(bool);
+
+impl ReleaseLocalModel {
+    fn after(config: &JobConfig) -> Self {
+        Self(releases_local_model(config))
+    }
+}
+
+impl Drop for ReleaseLocalModel {
+    fn drop(&mut self) {
+        if self.0 {
+            crate::local_llm::release("the transcript is finished");
+        }
+    }
+}
+
+/// Whether the local text model is unloaded right after this job: imported
+/// files, finished meetings and background cleanup retries that used AI
+/// cleanup or notes. Dictation keeps it for the next one (it is released after
+/// a few idle minutes), and so does a meeting between its parts.
+fn releases_local_model(config: &JobConfig) -> bool {
+    config.long_form
+        && config.session.map_or(true, |part| part.last)
+        && (config.should_enhance() || config.notes)
 }
 
 /// Longest window handed to the engine in one call for long-form audio.
@@ -3193,5 +3224,45 @@ mod tests {
             1
         );
         assert!(plan_long_form_windows(&[], 16_000).is_empty());
+    }
+
+    #[test]
+    fn local_text_model_is_released_after_transcripts_only() {
+        let mut settings = Settings::default();
+        settings.enhance.mode = crate::settings::EnhanceMode::Always;
+
+        assert!(releases_local_model(&JobConfig::long_form(
+            settings.clone()
+        )));
+        assert!(releases_local_model(&JobConfig::rerun(
+            settings.clone(),
+            Rerun::Clean { raw: "text".into() }
+        )));
+        let part = |last| SessionPart {
+            id: 1,
+            offset_samples: 0,
+            last,
+        };
+        assert!(!releases_local_model(&JobConfig::meeting_part(
+            settings.clone(),
+            part(false),
+            false
+        )));
+        assert!(releases_local_model(&JobConfig::meeting_part(
+            settings.clone(),
+            part(true),
+            false
+        )));
+        assert!(!releases_local_model(&JobConfig::new(
+            settings.clone(),
+            RecordingIntent::Enhance,
+            None,
+            false
+        )));
+
+        let mut off = settings.clone();
+        off.enhance.mode = crate::settings::EnhanceMode::Never;
+        assert!(!releases_local_model(&JobConfig::long_form(off.clone())));
+        assert!(releases_local_model(&JobConfig::meeting_notes(off)));
     }
 }

@@ -39,6 +39,10 @@ pub enum FallbackReason {
     EmptyModelId,
     /// The HTTP request failed or returned a non-success status.
     RequestFailed,
+    /// The provider refused the request itself (an HTTP 4xx status other
+    /// than a timeout or rate limit, e.g. an unsupported model): sending the
+    /// same request again will not help.
+    ProviderRejected(u16),
     /// The response could not be parsed into candidate text.
     ResponseUnparseable,
     /// The model produced empty output for a meaningful transcript.

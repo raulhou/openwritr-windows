@@ -88,6 +88,9 @@ fn fallback_reason_parts(reason: &cleanup::FallbackReason) -> (String, Vec<Strin
         FallbackReason::InvalidEndpoint => ("InvalidEndpoint".to_string(), vec![]),
         FallbackReason::EmptyModelId => ("EmptyModelId".to_string(), vec![]),
         FallbackReason::RequestFailed => ("RequestFailed".to_string(), vec![]),
+        FallbackReason::ProviderRejected(status) => {
+            ("ProviderRejected".to_string(), vec![status.to_string()])
+        }
         FallbackReason::ResponseUnparseable => ("ResponseUnparseable".to_string(), vec![]),
         FallbackReason::EmptyCandidate => ("EmptyCandidate".to_string(), vec![]),
         FallbackReason::ValidatorError => ("ValidatorError".to_string(), vec![]),

@@ -12,33 +12,79 @@ use crate::cleanup::{
 use crate::credentials::read_openai_api_key;
 use crate::settings::{EnhanceMode, Settings};
 use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
-use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use thiserror::Error;
 use tracing::{info, warn};
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum CopilotAuthError {
-    #[error("GitHub CLI (gh) was not found. Install it with `winget install GitHub.cli`, then run `gh auth login`")]
-    CliMissing,
-    #[error("GitHub CLI is not authenticated; run `gh auth login`")]
-    NotAuthenticated,
-    #[error("GitHub CLI token lookup failed: {0}")]
-    CommandFailed(String),
+/// Set when OpenWritr quits without finishing its work: requests still
+/// waiting for an answer are abandoned at once instead of holding up the exit
+/// for as long as their timeout.
+static CANCEL_REQUESTS: AtomicBool = AtomicBool::new(false);
+
+/// Abandon every cleanup or notes request in flight (OpenWritr is quitting).
+pub fn cancel_requests() {
+    CANCEL_REQUESTS.store(true, Ordering::Release);
 }
+
+/// Run `work` (a blocking HTTP exchange) on its own thread and wait for it,
+/// giving up early when [`cancel_requests`] is called. An abandoned thread
+/// ends by itself when its request does, or with the process.
+fn run_cancellable<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, &'static str> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cleanup-request".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|_| "could not start the request thread")?;
+    loop {
+        if CANCEL_REQUESTS.load(Ordering::Acquire) {
+            return Err("abandoned because OpenWritr is quitting");
+        }
+        match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(value) => return Ok(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("the request thread stopped unexpectedly")
+            }
+        }
+    }
+}
+
+/// Whether an HTTP error status means the provider refused this request as
+/// such, so sending it again cannot help. Timeouts (408) and rate limits
+/// (429) are worth another try later.
+fn is_rejection(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && !matches!(status.as_u16(), 408 | 429)
+}
+
+/// The start of a provider's error message, on one line, for the log. Error
+/// bodies describe the request (model, parameters), not the transcript.
+fn error_excerpt(body: &str) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut excerpt: String = flat.chars().take(300).collect();
+    if flat.chars().count() > 300 {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
+pub use crate::copilot_auth::{CopilotAuthError, TokenSource};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopilotReadiness {
-    Ready,
+    /// Signed in; says where the sign-in was found.
+    Ready(TokenSource),
     CliMissing,
     NotAuthenticated,
     Failed(String),
 }
 
 pub fn github_copilot_readiness() -> CopilotReadiness {
-    match gh_token() {
-        Ok(_) => CopilotReadiness::Ready,
+    match crate::copilot_auth::copilot_token() {
+        Ok((_, source)) => CopilotReadiness::Ready(source),
         Err(CopilotAuthError::CliMissing) => CopilotReadiness::CliMissing,
         Err(CopilotAuthError::NotAuthenticated) => CopilotReadiness::NotAuthenticated,
         Err(error) => CopilotReadiness::Failed(error.to_string()),
@@ -190,6 +236,26 @@ fn local_timeout(base: Duration, input_chars: usize) -> Duration {
     (base * LOCAL_TIMEOUT_FACTOR).max(Duration::from_millis(60_000 + input_chars as u64 * 250))
 }
 
+/// A hosted model on a poor connection: the request and the reply can crawl,
+/// and the reply is about as long as the text, so allow a generous fixed
+/// wait plus time per character of text.
+const HOSTED_BASE_WAIT: Duration = Duration::from_secs(45);
+const HOSTED_WAIT_PER_CHAR: Duration = Duration::from_millis(40);
+/// Nothing hosted waits longer than this.
+const HOSTED_MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// How long to wait for a hosted model: never less than `base`, and growing
+/// with the text (a 3,000 character slice of Chinese, about as many tokens
+/// to write, gets close to three minutes).
+fn hosted_timeout(base: Duration, input_chars: usize) -> Duration {
+    let by_length = HOSTED_BASE_WAIT + HOSTED_WAIT_PER_CHAR * input_chars.min(1_000_000) as u32;
+    base.max(by_length).min(HOSTED_MAX_WAIT.max(base))
+}
+
+/// A connection that could not even be opened is tried once more after
+/// this pause (a dropped Wi-Fi or mobile link often recovers in seconds).
+const CONNECT_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
 /// Length of the user message in a chat request body.
 fn request_input_chars(body: &serde_json::Value) -> usize {
     body.get("messages")
@@ -203,6 +269,36 @@ fn request_input_chars(body: &serde_json::Value) -> usize {
 /// Whether the target is an OpenAI-compatible server on this machine.
 fn is_local_target(target: &PromptTarget) -> bool {
     target.endpoint().is_some_and(EndpointScope::is_loopback)
+}
+
+/// Whether the target is the server OpenWritr starts itself (GenieX on the NPU).
+fn is_managed_target(target: &PromptTarget) -> bool {
+    target.endpoint().is_some_and(crate::local_llm::is_managed)
+}
+
+/// Whether the configured cleanup provider is the built-in model on the NPU.
+fn uses_managed_model(settings: &Settings) -> bool {
+    settings
+        .prompt_target()
+        .map(|target| is_managed_target(&target))
+        .unwrap_or(false)
+}
+
+/// Replies shorter than this say too little about the writing speed.
+const SLOW_CHECK_MIN_TOKENS: u64 = 24;
+
+/// The writing speed the server reported for a reply, when the reply was long
+/// enough to judge it by.
+fn writing_speed(value: &serde_json::Value) -> Option<f64> {
+    let timings = value.get("timings")?;
+    let written = timings.get("predicted_n")?.as_u64()?;
+    if written < SLOW_CHECK_MIN_TOKENS {
+        return None;
+    }
+    timings
+        .get("predicted_per_second")?
+        .as_f64()
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
 }
 
 /// Whether the configured cleanup provider is a model on this machine.
@@ -243,6 +339,12 @@ fn local_max_tokens(text: &str) -> usize {
 /// Small local models have short context windows and generate slowly, so
 /// they get smaller slices than a hosted model.
 const LOCAL_CLEANUP_CHARS: usize = 1_200;
+/// The built-in model gets smaller slices still, so a request (about 160
+/// tokens of instructions, the slice, and a reply as long as the slice)
+/// stays inside GenieX's smallest 512-token context. A request that outgrew
+/// it switched the model to its 1,024-token variant, and from that token on
+/// the NPU wrote about 20 times slower until the server was restarted.
+const MANAGED_CLEANUP_CHARS: usize = 600;
 const LOCAL_NOTES_PART_CHARS: usize = 8_000;
 
 /// Chinese, Japanese and Korean text costs about one token per character,
@@ -272,7 +374,9 @@ fn is_cjk(c: char) -> bool {
 }
 
 fn cleanup_slice_chars(settings: &Settings, text: &str) -> usize {
-    if uses_local_model(settings) {
+    if uses_managed_model(settings) {
+        scaled_for_script(MANAGED_CLEANUP_CHARS, text)
+    } else if uses_local_model(settings) {
         scaled_for_script(LOCAL_CLEANUP_CHARS, text)
     } else {
         LONG_FORM_CLEANUP_CHARS
@@ -303,8 +407,8 @@ fn request_content(
     // LM Studio, GenieX, ...) usually needs no key, so for those the key is
     // optional and a failed lookup just means "send none".
     let token = match provider {
-        EnhanceProvider::GithubCopilot => match gh_token() {
-            Ok(token) => Some(token),
+        EnhanceProvider::GithubCopilot => match crate::copilot_auth::copilot_token() {
+            Ok((token, _)) => Some(token),
             Err(error) => {
                 warn!(error = %error, "GitHub Copilot credential lookup failed");
                 return Err(FallbackReason::MissingCredential);
@@ -334,7 +438,7 @@ fn request_content(
     let timeout = if local {
         local_timeout(timeout, request_input_chars(&prepared.body))
     } else {
-        timeout
+        hosted_timeout(timeout, request_input_chars(&prepared.body))
     };
 
     let client = match reqwest::blocking::Client::builder()
@@ -370,9 +474,49 @@ fn request_content(
         return Err(reason);
     }
 
+    let managed = is_managed_target(&prepared.target);
     let sent = Instant::now();
-    let response = match request.send() {
-        Ok(response) => response,
+    // Only a hosted provider is worth a second try: a server on this machine
+    // that cannot be reached will not be there two seconds later either.
+    let retry = if local { None } else { request.try_clone() };
+    let exchange = move || -> reqwest::Result<(reqwest::StatusCode, String)> {
+        let mut result = request.send();
+        if let Some(again) = retry {
+            if result.as_ref().is_err_and(|error| error.is_connect()) {
+                warn!("could not connect to the cleanup provider; trying once more");
+                std::thread::sleep(CONNECT_RETRY_PAUSE);
+                result = again.send();
+            }
+        }
+        let response = result?;
+        let status = response.status();
+        Ok((status, response.text()?))
+    };
+    let result = match run_cancellable(exchange) {
+        Ok(result) => result,
+        Err(why) => {
+            info!(waited = ?sent.elapsed(), "cleanup request {why}");
+            if managed {
+                crate::local_llm::release("the cleanup request was abandoned");
+            }
+            return Err(FallbackReason::RequestFailed);
+        }
+    };
+    let (status, body) = match result {
+        Ok(answer) => answer,
+        Err(error) if error.is_timeout() => {
+            warn!(
+                waited = ?sent.elapsed(),
+                limit = ?timeout,
+                "cleanup provider did not answer in time"
+            );
+            if managed {
+                // The server keeps writing the reply nobody waits for, and
+                // every later request would queue behind it.
+                crate::local_llm::release("the local model did not answer in time");
+            }
+            return Err(FallbackReason::RequestFailed);
+        }
         Err(error) => {
             warn!(
                 error = %error,
@@ -383,11 +527,19 @@ fn request_content(
             return Err(FallbackReason::RequestFailed);
         }
     };
-    if !response.status().is_success() {
-        warn!(status = %response.status(), "cleanup provider returned an error");
-        return Err(FallbackReason::RequestFailed);
+    if !status.is_success() {
+        warn!(
+            status = %status,
+            detail = %error_excerpt(&body),
+            "cleanup provider returned an error"
+        );
+        return Err(if is_rejection(status) {
+            FallbackReason::ProviderRejected(status.as_u16())
+        } else {
+            FallbackReason::RequestFailed
+        });
     }
-    let value: serde_json::Value = match response.json() {
+    let value: serde_json::Value = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "cleanup provider response was not valid JSON");
@@ -401,6 +553,12 @@ fn request_content(
             timings = %value.get("timings").unwrap_or(&serde_json::Value::Null),
             "local model answered"
         );
+        if managed {
+            // This answer is still used; a restart is for the next one.
+            if let Some(rate) = writing_speed(&value) {
+                crate::local_llm::note_writing_speed(rate);
+            }
+        }
     }
     let content = match adapter::parse_chat_response(&value) {
         Ok(content) => content,
@@ -457,8 +615,9 @@ pub struct CleanupReport {
     pub total: usize,
     /// Slices the provider cleaned.
     pub cleaned: usize,
-    /// Slices left as recognised because the provider could not be reached
-    /// (or the circuit breaker skipped them): worth trying again later.
+    /// Slices left as recognised because the provider could not be reached or
+    /// did not answer in time (or the circuit breaker skipped them): worth
+    /// trying again later.
     pub unreachable: usize,
 }
 
@@ -508,12 +667,65 @@ pub fn enhance_long_form(
     interrupted: impl Fn() -> bool,
     progress: impl FnMut(usize, usize),
 ) -> Option<LongFormCleanup> {
+    let slice_chars = cleanup_slice_chars(settings, text);
+    let slices = split_for_cleanup(text, slice_chars);
+    let joins = joins_between(text, &slices);
+    info!(
+        provider = %settings.enhance.provider,
+        model = %settings.enhance.model,
+        slices = slices.len(),
+        slice_chars,
+        "long-form cleanup started"
+    );
+    let managed = uses_managed_model(settings);
     clean_slices(
-        split_for_cleanup(text, cleanup_slice_chars(settings, text)),
+        slices,
+        &joins,
         |slice| enhance_outcome(slice, settings, || !interrupted()),
+        &|| managed && crate::local_llm::keeps_writing_slowly(),
         &interrupted,
         progress,
     )
+}
+
+/// What to put back between each slice and the one before it: the kind of
+/// gap the text had there. A cut between speaker blocks gets the blank line
+/// back; a cut inside a block gets a space, a line break or nothing (Chinese
+/// has no spaces), so the number of blocks stays the same. The `[m:ss]`
+/// markers are put back block by block, and a single extra blank line used
+/// to make every marker in the transcript disappear.
+///
+/// `slices` must be parts of `text`, as [`split_for_cleanup`] returns them.
+fn joins_between(text: &str, slices: &[&str]) -> Vec<&'static str> {
+    // Byte offset of a slice inside `text` (None if it is not part of it).
+    let offset = |slice: &str| (slice.as_ptr() as usize).checked_sub(text.as_ptr() as usize);
+    slices
+        .windows(2)
+        .map(|pair| {
+            let gap = offset(pair[0])
+                .zip(offset(pair[1]))
+                .and_then(|(first, second)| text.get(first + pair[0].len()..second));
+            match gap {
+                None => "\n\n",
+                Some(gap) if gap.contains("\n\n") => "\n\n",
+                Some(gap) if gap.contains('\n') => "\n",
+                Some("") => "",
+                Some(_) => " ",
+            }
+        })
+        .collect()
+}
+
+/// `slices` joined with the gaps from [`joins_between`].
+fn join_slices<'a>(slices: impl IntoIterator<Item = &'a str>, joins: &[&str]) -> String {
+    let mut joined = String::new();
+    for (index, slice) in slices.into_iter().enumerate() {
+        if index > 0 {
+            joined.push_str(joins.get(index - 1).copied().unwrap_or("\n\n"));
+        }
+        joined.push_str(slice);
+    }
+    joined
 }
 
 /// What cleanup would report if it were skipped outright (the provider was
@@ -521,19 +733,27 @@ pub fn enhance_long_form(
 /// slice is marked for a later retry.
 pub fn skipped_cleanup(text: &str, settings: &Settings) -> LongFormCleanup {
     let slices = split_for_cleanup(text, cleanup_slice_chars(settings, text));
+    let joins = joins_between(text, &slices);
     LongFormCleanup {
         report: CleanupReport {
             total: slices.len(),
             cleaned: 0,
             unreachable: slices.len(),
         },
-        outcome: EnhanceOutcome::raw_fallback(slices.join("\n\n"), FallbackReason::RequestFailed),
+        outcome: EnhanceOutcome::raw_fallback(
+            join_slices(slices.iter().copied(), &joins),
+            FallbackReason::RequestFailed,
+        ),
     }
 }
 
+/// `joins[i]` goes between slice `i` and slice `i + 1` (a blank line when
+/// missing).
 fn clean_slices(
     slices: Vec<&str>,
+    joins: &[&str],
     mut clean: impl FnMut(&str) -> Option<EnhanceOutcome>,
+    give_up: &dyn Fn() -> bool,
     interrupted: &dyn Fn() -> bool,
     mut progress: impl FnMut(usize, usize),
 ) -> Option<LongFormCleanup> {
@@ -547,17 +767,22 @@ fn clean_slices(
     let mut first_failure: Option<FallbackReason> = None;
     let mut in_a_row = 0usize;
     let mut tripped = false;
+    // The provider refused the request: the rest would be refused too, and a
+    // later retry as well, so they are not marked for one.
+    let mut rejected = false;
 
     for (index, slice) in slices.into_iter().enumerate() {
         if interrupted() {
             return None;
         }
-        if !joined.is_empty() {
-            joined.push_str("\n\n");
+        if index > 0 {
+            joined.push_str(joins.get(index - 1).copied().unwrap_or("\n\n"));
         }
         if tripped {
             joined.push_str(slice);
-            report.unreachable += 1;
+            if !rejected {
+                report.unreachable += 1;
+            }
             progress(index + 1, total);
             continue;
         }
@@ -574,8 +799,15 @@ fn clean_slices(
                     in_a_row += 1;
                     if in_a_row >= UNREACHABLE_TRIP {
                         tripped = true;
-                        warn!("cleanup provider unreachable; skipping the remaining slices");
+                        warn!(
+                            failures = in_a_row,
+                            "cleanup provider unreachable or too slow; skipping the remaining slices"
+                        );
                     }
+                } else if matches!(reason, FallbackReason::ProviderRejected(_)) {
+                    tripped = true;
+                    rejected = true;
+                    warn!("cleanup provider rejected the request; the remaining slices keep their raw text");
                 } else {
                     in_a_row = 0;
                 }
@@ -585,6 +817,10 @@ fn clean_slices(
         }
         progress(index + 1, total);
         info!(slice = index + 1, total, "long-form cleanup slice done");
+        if !tripped && index + 1 < total && give_up() {
+            tripped = true;
+            warn!("cleanup is too slow to finish; the remaining slices are left for later");
+        }
     }
 
     let failed = report.total - report.cleaned;
@@ -743,6 +979,7 @@ fn fallback_diagnostic(reason: &FallbackReason) -> &'static str {
         FallbackReason::InvalidEndpoint => "invalid OpenAI-compatible endpoint",
         FallbackReason::EmptyModelId => "enhancement model ID is empty",
         FallbackReason::RequestFailed => "enhancement provider request failed",
+        FallbackReason::ProviderRejected(_) => "enhancement provider rejected the request",
         FallbackReason::ResponseUnparseable => "enhancement provider response was invalid",
         FallbackReason::EmptyCandidate => "enhancement returned an empty candidate",
         FallbackReason::IntegrityRejected(_) => "enhancement failed integrity validation",
@@ -750,108 +987,9 @@ fn fallback_diagnostic(reason: &FallbackReason) -> &'static str {
     }
 }
 
-/// Places `gh.exe` can be, in the order to look: the PATH this process
-/// started with, then the usual install folders. A program started before
-/// `gh` was installed (or by Windows at sign-in) does not see the new PATH
-/// entry, so the installer's own folders are checked too.
-fn gh_candidates(
-    path_var: Option<&std::ffi::OsStr>,
-    local_app_data: Option<&std::path::Path>,
-    program_files: &[std::path::PathBuf],
-    user_profile: Option<&std::path::Path>,
-) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Some(path) = path_var {
-        out.extend(std::env::split_paths(path).map(|dir| dir.join("gh.exe")));
-    }
-    for dir in program_files {
-        out.push(dir.join("GitHub CLI").join("gh.exe"));
-    }
-    if let Some(dir) = local_app_data {
-        out.push(dir.join("Programs").join("GitHub CLI").join("gh.exe"));
-        out.push(
-            dir.join("Microsoft")
-                .join("WinGet")
-                .join("Links")
-                .join("gh.exe"),
-        );
-    }
-    if let Some(dir) = user_profile {
-        out.push(dir.join("scoop").join("shims").join("gh.exe"));
-    }
-    out
-}
-
-/// The GitHub CLI to run: the first existing candidate, else plain `gh`.
-fn locate_gh() -> std::path::PathBuf {
-    let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
-    let program_files: Vec<_> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
-        .iter()
-        .filter_map(|name| var(name))
-        .collect();
-    let path = std::env::var_os("PATH");
-    gh_candidates(
-        path.as_deref(),
-        var("LOCALAPPDATA").as_deref(),
-        &program_files,
-        var("USERPROFILE").as_deref(),
-    )
-    .into_iter()
-    .find(|candidate| candidate.is_file())
-    .unwrap_or_else(|| "gh".into())
-}
-
-fn gh_token() -> std::result::Result<String, CopilotAuthError> {
-    // Cache the token for 10 minutes so we don't spawn `gh` on every call.
-    static CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
-    {
-        let g = CACHE.lock();
-        if let Some((tok, t)) = g.as_ref() {
-            if t.elapsed() < Duration::from_secs(600) {
-                return Ok(tok.clone());
-            }
-        }
-    }
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new(locate_gh())
-        .args(["auth", "token"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => CopilotAuthError::CliMissing,
-            _ => CopilotAuthError::CommandFailed(error.to_string()),
-        })?;
-    if !out.status.success() {
-        warn!(status = ?out.status.code(), "`gh auth token` failed");
-        return parse_gh_token_output(false, &out.stdout);
-    }
-    let s = parse_gh_token_output(true, &out.stdout)?;
-    *CACHE.lock() = Some((s.clone(), Instant::now()));
-    Ok(s)
-}
-
-fn parse_gh_token_output(
-    success: bool,
-    stdout: &[u8],
-) -> std::result::Result<String, CopilotAuthError> {
-    if !success {
-        return Err(CopilotAuthError::NotAuthenticated);
-    }
-    let token = String::from_utf8_lossy(stdout).trim().to_string();
-    if token.is_empty() {
-        Err(CopilotAuthError::NotAuthenticated)
-    } else {
-        Ok(token)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        credential_binding_outcome, credential_target_unchanged, parse_gh_token_output,
-        CopilotAuthError,
-    };
+    use super::{credential_binding_outcome, credential_target_unchanged};
     use crate::cleanup::{EndpointScope, FallbackReason, PromptTarget};
 
     fn openai_target(base_url: &str, model: &str) -> PromptTarget {
@@ -937,22 +1075,6 @@ mod tests {
         // always allowed to proceed.
         assert_eq!(credential_binding_outcome(&frozen, None), Ok(()));
     }
-
-    #[test]
-    fn classifies_github_cli_token_results_without_exposing_tokens() {
-        assert_eq!(
-            parse_gh_token_output(false, b"").unwrap_err(),
-            CopilotAuthError::NotAuthenticated
-        );
-        assert_eq!(
-            parse_gh_token_output(true, b" \r\n").unwrap_err(),
-            CopilotAuthError::NotAuthenticated
-        );
-        assert_eq!(
-            parse_gh_token_output(true, b"secret-token\r\n").unwrap(),
-            "secret-token"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -966,40 +1088,18 @@ mod long_form_tests {
     }
 
     #[test]
-    fn gh_is_searched_on_path_then_in_the_usual_install_folders() {
-        use std::path::{Path, PathBuf};
-        let path = std::env::join_paths(["tools", "bin"]).unwrap();
-        let found = gh_candidates(
-            Some(&path),
-            Some(Path::new("local")),
-            &[PathBuf::from("programs")],
-            Some(Path::new("home")),
-        );
-        assert_eq!(
-            found,
-            [
-                Path::new("tools").join("gh.exe"),
-                Path::new("bin").join("gh.exe"),
-                Path::new("programs").join("GitHub CLI").join("gh.exe"),
-                Path::new("local")
-                    .join("Programs")
-                    .join("GitHub CLI")
-                    .join("gh.exe"),
-                Path::new("local")
-                    .join("Microsoft")
-                    .join("WinGet")
-                    .join("Links")
-                    .join("gh.exe"),
-                Path::new("home").join("scoop").join("shims").join("gh.exe"),
-            ]
-        );
-        assert!(gh_candidates(None, None, &[], None).is_empty());
-    }
-
-    #[test]
     fn local_profile_applies_only_to_loopback_endpoints() {
-        let local = openai_settings("http://127.0.0.1:18651/v1");
+        let managed = openai_settings("http://127.0.0.1:18651/v1");
+        assert!(uses_local_model(&managed));
+        assert!(uses_managed_model(&managed));
+        assert_eq!(
+            cleanup_slice_chars(&managed, "plain english text"),
+            MANAGED_CLEANUP_CHARS
+        );
+
+        let local = openai_settings("http://127.0.0.1:11434/v1");
         assert!(uses_local_model(&local));
+        assert!(!uses_managed_model(&local), "a server the user runs");
         assert_eq!(
             cleanup_slice_chars(&local, "plain english text"),
             LOCAL_CLEANUP_CHARS
@@ -1071,6 +1171,16 @@ mod long_form_tests {
         assert!(mixed_chars < 1_200 && mixed_chars > 400, "{mixed_chars}");
         assert_eq!(scaled_for_script(1_200, "   "), 1_200);
 
+        let dictation = hosted_timeout(CLEANUP_TIMEOUT, 100);
+        assert_eq!(dictation, Duration::from_secs(49));
+        assert!(hosted_timeout(CLEANUP_TIMEOUT, 3_000) > Duration::from_secs(160));
+        assert_eq!(hosted_timeout(CLEANUP_TIMEOUT, 40_000), HOSTED_MAX_WAIT);
+        assert_eq!(
+            hosted_timeout(NOTES_TIMEOUT, 10),
+            Duration::from_millis(120_000),
+            "never shorter than the caller's own limit"
+        );
+
         let short = local_timeout(CLEANUP_TIMEOUT, 100);
         assert_eq!(short, CLEANUP_TIMEOUT * LOCAL_TIMEOUT_FACTOR);
         assert!(local_timeout(CLEANUP_TIMEOUT, 1_200) > short);
@@ -1094,6 +1204,95 @@ mod long_form_tests {
         assert!(local
             .iter()
             .all(|slice| slice.chars().count() <= LOCAL_CLEANUP_CHARS));
+    }
+
+    #[test]
+    fn built_in_model_slices_stay_inside_its_smallest_context() {
+        const { assert!(MANAGED_CLEANUP_CHARS < LOCAL_CLEANUP_CHARS) };
+        let managed = openai_settings("http://127.0.0.1:18651/v1");
+        // The transcript from the failed run: Chinese, one slice of up to 400
+        // characters came to about 250 tokens; now at most 200 characters.
+        let chinese = "这是一段很长的中文文字，用来测试切分。".repeat(100);
+        assert_eq!(cleanup_slice_chars(&managed, &chinese), 200);
+        assert!(
+            split_for_cleanup(&chinese, cleanup_slice_chars(&managed, &chinese))
+                .iter()
+                .all(|slice| slice.chars().count() <= 200)
+        );
+    }
+
+    #[test]
+    fn rejoined_slices_keep_every_block_and_gap_of_the_text() {
+        // A speaker block far longer than one slice, as in a long Chinese
+        // turn: cutting it used to add blank lines, so the block count no
+        // longer matched the `[m:ss]` markers and every marker was dropped.
+        let chinese = "第一句话说得很长很长。".repeat(60);
+        let english = "Another sentence here. ".repeat(40);
+        let text = format!(
+            "Speaker 1: {chinese}\n\nSpeaker 2: 好的。\n\nSpeaker 1: {}",
+            english.trim_end()
+        );
+        for max_chars in [50, 200, 600, 3_000] {
+            let slices = split_for_cleanup(&text, max_chars);
+            let joins = joins_between(&text, &slices);
+            assert_eq!(joins.len(), slices.len().saturating_sub(1));
+            assert_eq!(
+                join_slices(slices.iter().copied(), &joins),
+                text,
+                "slices of {max_chars} characters"
+            );
+        }
+    }
+
+    #[test]
+    fn joins_follow_the_gap_in_the_text() {
+        let text = "One. Two.\nThree.\n\nFour.五。六。";
+        let part = |wanted: &str| -> &'static str {
+            let at = text.find(wanted).unwrap();
+            &text[at..at + wanted.len()]
+        };
+        let slices: Vec<&str> = ["One.", "Two.", "Three.", "Four.", "五。", "六。"]
+            .into_iter()
+            .map(part)
+            .collect();
+        assert_eq!(joins_between(text, &slices), [" ", "\n", "\n\n", "", ""]);
+        // A missing join falls back to a blank line.
+        assert_eq!(join_slices(["a", "b"], &[]), "a\n\nb");
+    }
+
+    #[test]
+    fn a_skipped_cleanup_returns_the_text_unchanged() {
+        let managed = openai_settings("http://127.0.0.1:18651/v1");
+        let text = format!(
+            "Speaker 1: {}\n\nSpeaker 2: 好。",
+            "很长的一句话。".repeat(80)
+        );
+        let skipped = skipped_cleanup(&text, &managed);
+        assert!(skipped.report.total > 1, "the long block is cut");
+        assert_eq!(skipped.outcome.text(), text);
+    }
+
+    #[test]
+    fn writing_speed_is_read_from_the_server_timings() {
+        // Timings as GenieX returned them before and after the slowdown.
+        let fast = serde_json::json!({"timings": {
+            "predicted_ms": 9841.135, "predicted_n": 179, "predicted_per_second": 18.19
+        }});
+        let slow = serde_json::json!({"timings": {
+            "predicted_n": 242, "predicted_per_second": 1.09
+        }});
+        let short = serde_json::json!({"timings": {
+            "predicted_n": 3, "predicted_per_second": 0.5
+        }});
+        assert_eq!(writing_speed(&fast), Some(18.19));
+        assert!(writing_speed(&fast).unwrap() > crate::local_llm::SLOW_WRITING_TOKENS_PER_SECOND);
+        assert!(writing_speed(&slow).unwrap() < crate::local_llm::SLOW_WRITING_TOKENS_PER_SECOND);
+        assert_eq!(writing_speed(&short), None, "too short to judge");
+        assert_eq!(writing_speed(&serde_json::json!({})), None);
+        assert_eq!(
+            writing_speed(&serde_json::json!({"timings": {"predicted_n": 50}})),
+            None
+        );
     }
 
     #[test]
@@ -1163,7 +1362,15 @@ mod long_form_tests {
 
     #[test]
     fn a_clean_run_reports_everything_cleaned() {
-        let result = clean_slices(slices(3), |_| enhanced("Clean."), &|| false, |_, _| {}).unwrap();
+        let result = clean_slices(
+            slices(3),
+            &[],
+            |_| enhanced("Clean."),
+            &|| false,
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(
             result.report,
             CleanupReport {
@@ -1181,6 +1388,7 @@ mod long_form_tests {
         let mut call = 0;
         let result = clean_slices(
             slices(6),
+            &[],
             |_| {
                 call += 1;
                 if call % 2 == 0 {
@@ -1189,6 +1397,7 @@ mod long_form_tests {
                     enhanced("Clean.")
                 }
             },
+            &|| false,
             &|| false,
             |_, _| {},
         )
@@ -1201,14 +1410,81 @@ mod long_form_tests {
     }
 
     #[test]
+    fn a_rejected_request_stops_without_scheduling_a_retry() {
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(5),
+            &[],
+            |_| {
+                calls += 1;
+                failed(FallbackReason::ProviderRejected(400))
+            },
+            &|| false,
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 1, "the same request would be refused again");
+        assert_eq!(result.report.cleaned, 0);
+        assert_eq!(result.report.unreachable, 0);
+        assert!(!result.report.needs_retry());
+        assert!(matches!(
+            result.outcome,
+            EnhanceOutcome::RawFallback {
+                reason: FallbackReason::ProviderRejected(400),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_model_that_keeps_writing_slowly_leaves_the_rest_for_later() {
+        let mut calls = 0;
+        let result = clean_slices(
+            slices(6),
+            &[],
+            |_| {
+                calls += 1;
+                enhanced("Clean.")
+            },
+            &|| true,
+            &|| false,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.report.cleaned, 1);
+        assert_eq!(result.report.unreachable, 5);
+        assert!(result.report.needs_retry());
+    }
+
+    #[test]
+    fn client_errors_are_rejections_but_timeouts_and_rate_limits_are_not() {
+        use reqwest::StatusCode;
+        assert!(is_rejection(StatusCode::BAD_REQUEST));
+        assert!(is_rejection(StatusCode::UNAUTHORIZED));
+        assert!(is_rejection(StatusCode::NOT_FOUND));
+        assert!(!is_rejection(StatusCode::REQUEST_TIMEOUT));
+        assert!(!is_rejection(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_rejection(StatusCode::BAD_GATEWAY));
+        assert_eq!(
+            error_excerpt("{\n  \"error\": \"model not supported\"\n}"),
+            "{ \"error\": \"model not supported\" }"
+        );
+        assert!(error_excerpt(&"x".repeat(400)).ends_with('…'));
+    }
+
+    #[test]
     fn three_unreachable_failures_in_a_row_skip_the_rest() {
         let mut calls = 0;
         let result = clean_slices(
             slices(10),
+            &[],
             |_| {
                 calls += 1;
                 failed(FallbackReason::RequestFailed)
             },
+            &|| false,
             &|| false,
             |_, _| {},
         )
@@ -1237,10 +1513,12 @@ mod long_form_tests {
         let mut calls = 0;
         let result = clean_slices(
             slices(5),
+            &[],
             |_| {
                 calls += 1;
                 failed(FallbackReason::IntegrityRejected(Vec::new()))
             },
+            &|| false,
             &|| false,
             |_, _| {},
         )
@@ -1252,7 +1530,15 @@ mod long_form_tests {
 
     #[test]
     fn interruption_returns_nothing() {
-        assert!(clean_slices(slices(3), |_| enhanced("x"), &|| true, |_, _| {}).is_none());
+        assert!(clean_slices(
+            slices(3),
+            &[],
+            |_| enhanced("x"),
+            &|| false,
+            &|| true,
+            |_, _| {}
+        )
+        .is_none());
     }
 
     #[test]
